@@ -5,13 +5,11 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from indexMapping import indexMapping
-from documentPreparation import prepareDocument, model
 import os
 import logging
 import uuid
 
+# Initialize Flask app
 app = Flask(__name__)
 
 # Configure logging
@@ -19,19 +17,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-ELASTICSEARCH_URL = os.getenv('ELASTICSEARCH_URL', 'http://localhost:9200')
-FIREBASE_CREDENTIALS = os.getenv('FIREBASE_CREDENTIALS', '/home/chumvi/Development/firebase/biashara-app.json')
+ELASTICSEARCH_CLOUD_ID = os.getenv('ELASTICSEARCH_CLOUD_ID')
+ELASTICSEARCH_USERNAME = os.getenv('ELASTICSEARCH_USERNAME')
+ELASTICSEARCH_PASSWORD = os.getenv('ELASTICSEARCH_PASSWORD')
+FIREBASE_CREDENTIALS_PATH = os.getenv('FIREBASE_CREDENTIALS_PATH')
 
-# Initialize Elasticsearch connection
+# Initialize Elasticsearch connection using Elastic Cloud
 try:
-    es = Elasticsearch(ELASTICSEARCH_URL)
+    es = Elasticsearch(
+        cloud_id=ELASTICSEARCH_CLOUD_ID,
+        basic_auth=(ELASTICSEARCH_USERNAME, ELASTICSEARCH_PASSWORD)
+    )
     if es.ping():
         logger.info("Connected to Elasticsearch")
     else:
         raise ConnectionError("Failed to connect to Elasticsearch")
 except ConnectionError as e:
     logger.error(f"Error connecting to Elasticsearch: {e}")
-    es = None  # Ensuring 'es' is not used if the connection fails
+    es = None  # Ensure 'es' is not used if the connection fails
 except AuthenticationException as e:
     logger.error(f"Authentication failed: {e}")
     es = None
@@ -41,19 +44,18 @@ except Exception as e:
 
 # Initialize Firestore connection
 try:
-    cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+    cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
     firebase_admin.initialize_app(cred)
     db = firestore.client()
     logger.info("Connected to Firestore")
 except Exception as e:
     logger.error(f"An error occurred with Firestore: {e}")
-    db = None  # Ensuring 'db' is not used if the connection fails
+    db = None  # Ensure 'db' is not used if the connection fails
 
 # Create the index with the mapping if it doesn't exist
 if es and not es.indices.exists(index="all_products"):
     es.indices.create(index="all_products", body=indexMapping)
     logger.info("Index 'all_products' created")
-
 
 # Function to index a new product in Elasticsearch
 def index_new_product(product):
@@ -66,19 +68,17 @@ def index_new_product(product):
     except Exception as e:
         logger.error(f"Error indexing product: {e}")
 
-
+# Function to get user query history from Firestore
 def get_user_query_history(user_id):
     try:
         searches_ref = db.collection('searchHistory').document(user_id).collection('searches')
         query_docs = searches_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).stream()
         query_history = [doc.to_dict().get('query', '') for doc in query_docs]
         logger.info(f"Query history for user {user_id}: {query_history}")
-        print(f"Successfully retrieved query history for user {user_id}: {query_history}")
         return query_history
     except Exception as e:
         logger.error(f"Error fetching user query history: {e}")
         return []
-
 
 # Function to recommend products based on user query history
 def recommend_products(user_id):
@@ -87,11 +87,9 @@ def recommend_products(user_id):
         if not query_history:
             return []
 
-        # Example recommendation logic: Find products similar to the most recent query
-        latest_query = query_history[-1]  # Assuming the last query is the most recent
+        latest_query = query_history[-1]  # Most recent query
         query_vector = model.encode(latest_query).tolist()
 
-        # Elasticsearch KNN query based on the query_vector
         knn_query = {
             "field": "DescriptionVector",
             "query_vector": query_vector,
@@ -102,19 +100,15 @@ def recommend_products(user_id):
         res = es.knn_search(
             index="all_products",
             knn=knn_query,
-            _source=["productName", "productDescription", "currency", "imageUrls", "videoUrls", "userId",
-                     "productPrice"]
+            _source=["productName", "productDescription", "currency", "imageUrls", "videoUrls", "userId", "productPrice"]
         )
 
-        # Extract _id and _source from hits and include id in the response
         results = [{"id": hit["_id"], **hit["_source"]} for hit in res["hits"]["hits"]]
         logger.info(f"Recommendations for user {user_id}: {results}")
-        print(f"Successfully generated recommendations for user {user_id}: {results}")
         return results
     except Exception as e:
         logger.error(f"Error recommending products: {e}")
         return []
-
 
 # Initialize the Swahili model and tokenizer
 model_name = "Mollel/swahili-serengeti-E250-nli-matryoshka"
@@ -127,10 +121,10 @@ if tokenizer.eos_token is None:
 try:
     chat_model = AutoModelForCausalLM.from_pretrained(model_name)
 except Exception as e:
-    print(f"Model loading failed: {e}")
+    logger.error(f"Model loading failed: {e}")
     chat_model = None
 
-
+# API route for chatbot interaction
 @app.route('/chat', methods=['POST'])
 def chat():
     if chat_model is None:
@@ -145,18 +139,17 @@ def chat():
     # Encode user input with EOS token
     inputs = tokenizer.encode(user_input + tokenizer.eos_token, return_tensors='pt')
 
-    # Generate response using the model with adjusted parameters
+    # Generate response using the model
     reply_ids = chat_model.generate(
         inputs,
         max_length=100,
         pad_token_id=tokenizer.eos_token_id,
-        temperature=0.7,  # Adjust temperature for randomness
-        top_p=0.9,  # Use nucleus sampling
-        top_k=50,  # Limit sampling to top-k tokens
-        repetition_penalty=1.2  # Penalize repetition
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.2
     )
 
-    # Decode the generated tokens to a string
     reply = tokenizer.decode(reply_ids[:, inputs.shape[-1]:][0], skip_special_tokens=True)
 
     # Store message and response in Firestore
@@ -176,6 +169,7 @@ def chat():
     db.collection('chats').document(chat_id).collection('messages').add(response_data)
 
     return jsonify({'response': reply})
+
 # API route to get recommendations based on user query history
 @app.route('/recommendations/<user_id>', methods=['GET'])
 def get_recommendations(user_id):
@@ -189,7 +183,6 @@ def get_recommendations(user_id):
         logger.error(f"Error getting recommendations: {e}")
         return jsonify({"error": f"Error getting recommendations: {e}"}), 500
 
-
 # API route to add a new product
 @app.route('/add_product', methods=['POST'])
 def add_product():
@@ -201,8 +194,6 @@ def add_product():
         logger.info(f"Received product data: {product}")
 
         # Validate input
-        if not product:
-            return jsonify({"error": "No product data provided"}), 400
         required_fields = ["productName", "productDescription", "currency", "userId", "productPrice"]
         for field in required_fields:
             if field not in product:
@@ -214,7 +205,7 @@ def add_product():
         logger.error(f"Error adding product: {e}")
         return jsonify({"error": f"Error adding product: {e}"}), 500
 
-
+# API route to update an existing product
 @app.route('/update_product/<product_id>', methods=['PUT'])
 def update_product(product_id):
     if not es:
@@ -253,67 +244,12 @@ def update_product(product_id):
         # Index the updated document in Elasticsearch
         res = es.index(index="all_products", id=product_id, document=doc)
         es.indices.refresh(index="all_products")  # Refresh the index to make the document searchable immediately
-        logger.info(f"Product updated and indexed successfully: {res['result']}")
+        logger.info(f"Product updated successfully: {res['result']}")
 
-        return jsonify({"message": "Product updated and indexed successfully"}), 200
+        return jsonify({"message": "Product updated successfully"}), 200
     except Exception as e:
         logger.error(f"Error updating product: {e}")
         return jsonify({"error": f"Error updating product: {e}"}), 500
 
-
-@app.route('/search', methods=['POST'])
-def knn_search():
-    if not es:
-        return jsonify({"error": "Elasticsearch is not available"}), 500
-
-    try:
-        data = request.json
-        input_keyword = data.get('keyword')
-        max_price = data.get('max_price')
-        color = data.get('color')
-        size = data.get('size')
-        brand = data.get('brand')
-        category = data.get('category')
-
-        if not input_keyword:
-            return jsonify({"error": "Keyword is required"}), 400
-
-        vector_of_input_keyword = model.encode(input_keyword).tolist()
-
-        knn_query = {
-            "field": "DescriptionVector",
-            "query_vector": vector_of_input_keyword,
-            "k": 4,
-            "num_candidates": 500
-        }
-
-        res = es.knn_search(index="all_products", knn=knn_query,
-                            _source=["productName", "productDescription", "currency", "imageUrls", "videoUrls",
-                                     "userId", "productPrice", "color", "size", "brand", "category",
-                                     "_id"])  # Include '_id'
-
-        results = [{**hit["_source"], "id": hit["_id"]} for hit in res["hits"]["hits"]]  # Add 'id' field
-
-        # Filter results based on additional criteria
-        filtered_results = []
-        for product in results:
-            if max_price and product['productPrice'] > max_price:
-                continue
-            if color and color.lower() not in product.get('color', '').lower():
-                continue
-            if size and size.lower() not in product.get('size', '').lower():
-                continue
-            if brand and brand.lower() not in product.get('brand', '').lower():
-                continue
-            if category and category.lower() not in product.get('category', '').lower():
-                continue
-            filtered_results.append(product)
-
-        return jsonify(filtered_results), 200
-    except Exception as e:
-        logger.error(f"Error performing KNN search: {e}")
-        return jsonify({"error": f"Error performing KNN search: {e}"}), 500
-
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(debug=True)
